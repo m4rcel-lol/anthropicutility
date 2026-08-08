@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist posted_items across restarts/redeploys.
+      - bot-data:/data
+
+volumes:
+  bot-data:

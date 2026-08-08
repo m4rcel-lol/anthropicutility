@@ -1,0 +1,8 @@
+.env
+*.db
+/data/
+/bot
+/tmp/
+*.exe
+*.test
+.DS_Store
