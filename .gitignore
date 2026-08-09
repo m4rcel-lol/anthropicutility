@@ -6,3 +6,4 @@
 *.exe
 *.test
 .DS_Store
+/anthropic-discord-bot
