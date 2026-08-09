@@ -5,22 +5,55 @@ Minimal Go Discord bot that polls a global Anthropic news RSS/Atom feed and post
 ## Features
 
 - Polls a single global feed (`NEWS_SOURCE_URL`) on a fixed interval
-- Per-server `/setup` (channel + optional ping role)
+- Per-server `/setup` (channel + optional ping role), re-runnable to edit a wrong setup
 - `/info` — feed status, newest item, posts anything not yet delivered to this server
 - `/postall` — force-post the whole feed to this server's channel, ignoring history
 - `/credits` — author and stack
 - SQLite history, tracked **per server**, so items are not re-posted after restarts
 - Embeds: white accent, AI logo thumbnail/footer, post banner image when available
 - Presence: Idle · Watching `Anthropic News | N servers`
+- Welcome DM to whoever invites the bot, with setup instructions
 
 ## Commands
 
 | Command | Who | What |
 |---------|-----|------|
-| `/setup channel:#… [ping_role:@…]` | Manage Server / Admin | Configure this server (once) |
+| `/setup [channel:#…] [ping_role:@…] [remove_ping_role:true]` | Manage Server / Admin | Configure this server, or edit an existing setup |
 | `/info` | Anyone | Feed info + check/post new items for this server |
 | `/postall [ping:true\|false]` | Manage Server / Admin | Post **every** feed entry to this server's channel, even ones already posted |
-| `/credits` | Anyone | Credits and tech stack |
+| `/credits` | Anyone | Credits, tech stack and the official server link |
+
+### Welcome DM
+
+When the bot joins a server it DMs the person who invited it: three embeds
+covering what the bot does, the `/setup` → `/info` → `/postall` steps, and the
+permissions it needs, plus a button to the official server.
+
+The inviter is read from the audit log (`BOT_ADD`); when the bot lacks **View
+Audit Log** — common on a fresh invite — it falls back to the server owner. A
+DM is sent at most once per server (tracked in `greeted_guilds`), and the
+gateway replaying guilds on reconnect never triggers one: only joins newer than
+five minutes qualify. A failed DM (inviter has DMs closed) is logged and
+skipped, never retried in a loop.
+
+The official server link is a compile-time constant in `bot.go`, not an
+environment variable — it is the same for every deployment.
+
+### Editing a setup
+
+Running `/setup` again in a server that is already configured **edits** it and
+reports exactly what changed (`old → new`), rather than refusing. Options you
+omit keep their current value, so a wrong channel can be corrected without
+restating the ping role:
+
+- `/setup channel:#correct-channel` — move the news channel, keep the role
+- `/setup ping_role:@News` — change the role, keep the channel
+- `/setup remove_ping_role:true` — stop mentioning any role
+- Re-running with identical values reports **Nothing changed**
+
+`channel` is only required the first time. Setting `ping_role` and
+`remove_ping_role:true` in the same call is rejected. Editing a setup does not
+re-post already-delivered items — use `/postall` for that.
 
 ### Per-server delivery history
 

@@ -27,6 +27,16 @@ const brandIconName = "icon.jpg"
 // message rate limit in one burst.
 const postAllDelay = 750 * time.Millisecond
 
+// Official community/support server. A compile-time constant on purpose: it is
+// the same for every deployment, so it is deliberately NOT an env var — no
+// operator should have to set it, and none should be able to point users
+// somewhere else.
+const supportServerInvite = "https://discord.gg/anthropicutility"
+
+// A GuildCreate older than this is the gateway re-sending guilds we were
+// already in (startup, reconnect), not a fresh invite — do not DM for those.
+const joinGreetWindow = 5 * time.Minute
+
 // Bot owns the Discord session and orchestrates poll → post + slash commands.
 type Bot struct {
 	cfg   *Config
@@ -47,6 +57,7 @@ func newBot(cfg *Config, store *Store) (*Bot, error) {
 
 	sess.AddHandler(b.onReady)
 	sess.AddHandler(b.onInteractionCreate)
+	sess.AddHandler(b.onGuildCreate)
 
 	if err := sess.Open(); err != nil {
 		return nil, fmt.Errorf("discord open: %w", err)
@@ -68,13 +79,15 @@ func (b *Bot) onReady(s *discordgo.Session, r *discordgo.Ready) {
 	commands := []*discordgo.ApplicationCommand{
 		{
 			Name:        "setup",
-			Description: "Configure the news channel and optional ping role for this server",
+			Description: "Configure or edit the news channel and ping role for this server",
 			Options: []*discordgo.ApplicationCommandOption{
 				{
 					Type:        discordgo.ApplicationCommandOptionChannel,
 					Name:        "channel",
 					Description: "Channel where Anthropic news embeds will be posted",
-					Required:    true,
+					// Optional so an existing setup can be edited one field at a
+					// time; required on first run, enforced in cmdSetup.
+					Required: false,
 					ChannelTypes: []discordgo.ChannelType{
 						discordgo.ChannelTypeGuildText,
 						discordgo.ChannelTypeGuildNews,
@@ -84,6 +97,12 @@ func (b *Bot) onReady(s *discordgo.Session, r *discordgo.Ready) {
 					Type:        discordgo.ApplicationCommandOptionRole,
 					Name:        "ping_role",
 					Description: "Role to mention when a new post arrives (optional)",
+					Required:    false,
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionBoolean,
+					Name:        "remove_ping_role",
+					Description: "Stop mentioning any role on new posts",
 					Required:    false,
 				},
 			},
@@ -120,6 +139,179 @@ func (b *Bot) onReady(s *discordgo.Session, r *discordgo.Ready) {
 	}
 }
 
+// onGuildCreate greets whoever invited the bot with a DM explaining what to do
+// next. The gateway also replays GuildCreate for guilds we are already in, so
+// this only fires for genuinely fresh joins that were never greeted before.
+func (b *Bot) onGuildCreate(s *discordgo.Session, g *discordgo.GuildCreate) {
+	if g.Unavailable {
+		return
+	}
+
+	// Keep the server count in the presence honest as servers come and go.
+	defer b.setPresence(s)
+
+	if time.Since(g.JoinedAt) > joinGreetWindow {
+		return // replayed on connect, not a new invite
+	}
+	greeted, err := b.store.HasGreeted(g.ID)
+	if err != nil {
+		log.Printf("event=store_error op=has_greeted guild=%s err=%q", g.ID, err.Error())
+		return
+	}
+	if greeted {
+		log.Printf("event=welcome_skip reason=already_greeted guild=%s", g.ID)
+		return
+	}
+
+	inviterID := b.resolveInviterID(s, g)
+	if inviterID == "" {
+		log.Printf("event=welcome_skip reason=no_recipient guild=%s", g.ID)
+		return
+	}
+
+	if err := b.sendWelcomeDM(s, inviterID, g.Guild); err != nil {
+		// Overwhelmingly this is the user having DMs from server members closed.
+		log.Printf("event=welcome_error guild=%s user=%s err=%q", g.ID, inviterID, err.Error())
+		return
+	}
+	if err := b.store.MarkGreeted(g.ID, inviterID); err != nil {
+		log.Printf("event=store_error op=mark_greeted guild=%s err=%q", g.ID, err.Error())
+	}
+	log.Printf("event=welcome_sent guild=%s guild_name=%q user=%s", g.ID, g.Name, inviterID)
+}
+
+// resolveInviterID finds who added the bot, via the audit log. That needs the
+// View Audit Log permission, which a fresh invite often lacks, so it falls back
+// to the server owner — who can act on the instructions either way.
+func (b *Bot) resolveInviterID(s *discordgo.Session, g *discordgo.GuildCreate) string {
+	var selfID string
+	if s.State != nil && s.State.User != nil {
+		selfID = s.State.User.ID
+	}
+
+	if selfID != "" {
+		auditLog, err := s.GuildAuditLog(g.ID, "", "", int(discordgo.AuditLogActionBotAdd), 10)
+		if err != nil {
+			log.Printf("event=audit_log_unavailable guild=%s err=%q", g.ID, err.Error())
+		} else {
+			for _, e := range auditLog.AuditLogEntries {
+				if e.TargetID == selfID && e.UserID != "" {
+					return e.UserID
+				}
+			}
+		}
+	}
+
+	if g.OwnerID != "" {
+		log.Printf("event=welcome_fallback target=owner guild=%s", g.ID)
+	}
+	return g.OwnerID
+}
+
+// sendWelcomeDM opens a DM and sends the three-embed welcome: thanks, the
+// setup steps, and where to get help.
+func (b *Bot) sendWelcomeDM(s *discordgo.Session, userID string, g *discordgo.Guild) error {
+	ch, err := s.UserChannelCreate(userID)
+	if err != nil {
+		return fmt.Errorf("open dm: %w", err)
+	}
+
+	iconRef := "attachment://" + brandIconName
+	serverName := g.Name
+	if serverName == "" {
+		serverName = "your server"
+	}
+
+	// Embed 1 — thanks + what this bot is for.
+	// Only this embed references the attachment: Discord binds an uploaded file
+	// to a single embed, so reusing the URL further down would render blank.
+	thanks := &discordgo.MessageEmbed{
+		Title: "Thanks for the invite!",
+		Description: fmt.Sprintf(
+			"**Anthropic Utility** is now in **%s**.\n\n"+
+				"It watches Anthropic's news feed and posts every new article to a channel you pick — "+
+				"title, excerpt, banner image and link, with an optional role mention.\n\n"+
+				"One thing left to do: tell it where to post.",
+			serverName,
+		),
+		Color:     embedColor,
+		Thumbnail: &discordgo.MessageEmbedThumbnail{URL: iconRef},
+	}
+
+	// Embed 2 — the actual instructions.
+	steps := &discordgo.MessageEmbed{
+		Title: "Set it up in under a minute",
+		Color: embedColor,
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name: "1. Pick the channel",
+				Value: "```/setup channel:#news ping_role:@Updates```" +
+					"`ping_role` is optional. Re-run `/setup` any time to change either one — " +
+					"it edits the existing setup and shows you exactly what changed.",
+			},
+			{
+				Name: "2. Confirm it works",
+				Value: "```/info```" +
+					"Shows the feed status and the newest article, and immediately posts anything " +
+					"this server has not received yet. If a post fails, it tells you why.",
+			},
+			{
+				Name: "3. Fill the channel (optional)",
+				Value: "```/postall```" +
+					"Posts the entire current feed, including articles already delivered elsewhere. " +
+					"Handy for a brand-new channel. Add `ping:false` to skip the role mention.",
+			},
+		},
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "/setup and /postall need Manage Server or Administrator.",
+		},
+	}
+
+	// Embed 3 — permissions, guarantees, support.
+	help := &discordgo.MessageEmbed{
+		Title: "Good to know",
+		Color: embedColor,
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name: "Permissions it needs in the news channel",
+				Value: "View Channel · Send Messages · Embed Links · Attach Files\n" +
+					"Missing one is the usual reason posts do not show up — `/info` will name it.",
+			},
+			{
+				Name: "Every server is independent",
+				Value: "Channel, role and delivery history are stored per server, " +
+					"so this one gets its own posts no matter what other servers already received.",
+			},
+			{
+				Name:  "Questions, bugs or ideas",
+				Value: fmt.Sprintf("Join the official server: %s\nRun `/credits` for the source and the stack.", supportServerInvite),
+			},
+		},
+	}
+
+	_, err = s.ChannelMessageSendComplex(ch.ID, &discordgo.MessageSend{
+		Embeds: []*discordgo.MessageEmbed{thanks, steps, help},
+		Files: []*discordgo.File{
+			{Name: brandIconName, Reader: bytes.NewReader(brandIcon)},
+		},
+		Components: []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.Button{
+						Label: "Join the official server",
+						Style: discordgo.LinkButton,
+						URL:   supportServerInvite,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("send dm: %w", err)
+	}
+	return nil
+}
+
 func (b *Bot) onInteractionCreate(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	if i.Type != discordgo.InteractionApplicationCommand {
 		return
@@ -148,6 +340,9 @@ func (b *Bot) cmdCredits(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		"• Discord: `github.com/bwmarrin/discordgo`",
 		"• Storage: SQLite via `modernc.org/sqlite` (pure Go)",
 		"• Feed: standard library `net/http` + `encoding/xml` (RSS 2.0 / Atom 1.0)",
+		"",
+		"**Official server**",
+		supportServerInvite,
 	}, "\n")
 
 	log.Printf("event=credits user=%s guild=%s", interactionUserID(i), i.GuildID)
@@ -442,32 +637,22 @@ func (b *Bot) cmdSetup(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	// Detect existing setup — do not overwrite; tell the user nothing more is needed.
+	// An existing setup is editable: re-running /setup applies whatever was
+	// passed and reports what changed, so a wrong channel or role can be fixed
+	// in place instead of being refused.
 	existing, err := b.store.GetGuildConfig(i.GuildID)
 	if err != nil {
 		log.Printf("event=setup_error op=get guild=%s err=%q", i.GuildID, err.Error())
 		b.respondEphemeral(s, i, "Failed to read settings. Try again later.")
 		return
 	}
-	if existing != nil {
-		msg := fmt.Sprintf(
-			"This server is **already set up** — nothing more needs to be configured.\n\n• News channel: <#%s>",
-			existing.ChannelID,
-		)
-		if existing.PingRoleID != "" {
-			msg += fmt.Sprintf("\n• Ping role: <@&%s>", existing.PingRoleID)
-		} else {
-			msg += "\n• Ping role: _(none)_"
-		}
-		msg += "\n\nThe news feed is global and the same for every server — it cannot be changed here."
-		log.Printf("event=setup_already guild=%s channel=%s ping_role=%s", i.GuildID, existing.ChannelID, existing.PingRoleID)
-		b.respondEphemeral(s, i, msg)
-		return
-	}
 
-	opts := i.ApplicationCommandData().Options
-	var channelID, pingRoleID string
-	for _, o := range opts {
+	var (
+		channelID, pingRoleID string
+		pingProvided          bool
+		removePing            bool
+	)
+	for _, o := range i.ApplicationCommandData().Options {
 		switch o.Name {
 		case "channel":
 			if ch := o.ChannelValue(s); ch != nil {
@@ -476,30 +661,110 @@ func (b *Bot) cmdSetup(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		case "ping_role":
 			if role := o.RoleValue(s, i.GuildID); role != nil {
 				pingRoleID = role.ID
+				pingProvided = true
 			}
+		case "remove_ping_role":
+			removePing = o.BoolValue()
 		}
 	}
-	if channelID == "" {
-		b.respondEphemeral(s, i, "A text channel is required.")
+
+	newChannel, newPing, err := resolveSetup(existing, setupInput{
+		ChannelID:    channelID,
+		PingRoleID:   pingRoleID,
+		PingProvided: pingProvided,
+		RemovePing:   removePing,
+	})
+	if err != nil {
+		b.respondEphemeral(s, i, err.Error())
 		return
 	}
 
-	if err := b.store.SetGuildConfig(i.GuildID, channelID, pingRoleID); err != nil {
+	if existing != nil && existing.ChannelID == newChannel && existing.PingRoleID == newPing {
+		msg := fmt.Sprintf(
+			"**Nothing changed** — this server was already set up exactly like that.\n\n• News channel: <#%s>\n• Ping role: %s",
+			newChannel, roleLabel(newPing),
+		)
+		log.Printf("event=setup_unchanged guild=%s channel=%s ping_role=%s", i.GuildID, newChannel, newPing)
+		b.respondEphemeral(s, i, msg)
+		return
+	}
+
+	if err := b.store.SetGuildConfig(i.GuildID, newChannel, newPing); err != nil {
 		log.Printf("event=setup_error guild=%s err=%q", i.GuildID, err.Error())
 		b.respondEphemeral(s, i, "Failed to save settings. Try again later.")
 		return
 	}
 
-	msg := fmt.Sprintf("Setup saved.\n• News channel: <#%s>", channelID)
-	if pingRoleID != "" {
-		msg += fmt.Sprintf("\n• Ping role: <@&%s>", pingRoleID)
+	var msg string
+	if existing == nil {
+		msg = fmt.Sprintf("**Setup saved.**\n• News channel: <#%s>\n• Ping role: %s",
+			newChannel, roleLabel(newPing))
+		log.Printf("event=setup op=create guild=%s channel=%s ping_role=%s", i.GuildID, newChannel, newPing)
 	} else {
-		msg += "\n• Ping role: _(none)_"
+		// Show old → new for each field so the edit is unambiguous.
+		lines := []string{"**Setup edited.**", ""}
+		if existing.ChannelID != newChannel {
+			lines = append(lines, fmt.Sprintf("• News channel: <#%s> → **<#%s>**", existing.ChannelID, newChannel))
+		} else {
+			lines = append(lines, fmt.Sprintf("• News channel: <#%s> _(unchanged)_", newChannel))
+		}
+		if existing.PingRoleID != newPing {
+			lines = append(lines, fmt.Sprintf("• Ping role: %s → **%s**", roleLabel(existing.PingRoleID), roleLabel(newPing)))
+		} else {
+			lines = append(lines, fmt.Sprintf("• Ping role: %s _(unchanged)_", roleLabel(newPing)))
+		}
+		msg = strings.Join(lines, "\n")
+		log.Printf("event=setup op=edit guild=%s channel=%s→%s ping_role=%s→%s",
+			i.GuildID, existing.ChannelID, newChannel, existing.PingRoleID, newPing)
 	}
-	msg += "\n\nThe news feed is global and the same for every server — it cannot be changed here."
 
-	log.Printf("event=setup guild=%s channel=%s ping_role=%s", i.GuildID, channelID, pingRoleID)
+	msg += "\n\nThe news feed is global and the same for every server — it cannot be changed here."
+	msg += "\nAlready-delivered items are not re-posted; use `/postall` to seed a channel with the full feed."
 	b.respondEphemeral(s, i, msg)
+}
+
+// setupInput is what the user passed to /setup for this invocation.
+type setupInput struct {
+	ChannelID    string
+	PingRoleID   string
+	PingProvided bool // ping_role was supplied
+	RemovePing   bool // remove_ping_role:true was supplied
+}
+
+// resolveSetup merges a /setup invocation over the server's existing config.
+// Omitted fields keep their current value, so one field can be corrected without
+// restating the others. The channel is only mandatory on first run, when there
+// is nothing to fall back to.
+func resolveSetup(existing *GuildConfig, in setupInput) (channelID, pingRoleID string, err error) {
+	if in.PingProvided && in.RemovePing {
+		return "", "", fmt.Errorf("Pick one: either set `ping_role` or use `remove_ping_role:true` — not both.")
+	}
+
+	channelID = in.ChannelID
+	if channelID == "" {
+		if existing == nil {
+			return "", "", fmt.Errorf("A text channel is required the first time you run `/setup`.")
+		}
+		channelID = existing.ChannelID
+	}
+
+	switch {
+	case in.RemovePing:
+		pingRoleID = ""
+	case in.PingProvided:
+		pingRoleID = in.PingRoleID
+	case existing != nil:
+		pingRoleID = existing.PingRoleID
+	}
+	return channelID, pingRoleID, nil
+}
+
+// roleLabel renders a ping role for user-facing text, or "(none)" when unset.
+func roleLabel(roleID string) string {
+	if roleID == "" {
+		return "_(none)_"
+	}
+	return fmt.Sprintf("<@&%s>", roleID)
 }
 
 func (b *Bot) respondEphemeral(s *discordgo.Session, i *discordgo.InteractionCreate, content string) {
