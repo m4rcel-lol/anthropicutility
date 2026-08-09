@@ -4,9 +4,10 @@ import (
 	"encoding/xml"
 	"fmt"
 	"html"
-	"regexp"
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -14,12 +15,93 @@ import (
 
 // NewsItem is a normalized feed entry used by the rest of the bot.
 type NewsItem struct {
-	ID        string    // stable key: prefer GUID, fall back to Link
+	ID        string   // stable dedup key, derived from the canonical article URL
+	LegacyIDs []string // raw guid/link, so history from older builds still matches
 	Title     string
 	Link      string
 	Published time.Time
 	Summary   string // plain text (tags stripped)
 	ImageURL  string // best banner/hero image from the entry, if any
+}
+
+// keys returns every key under which this article may have been recorded:
+// the current one first, then any a previous build would have used.
+func (n NewsItem) keys() []string {
+	return append([]string{n.ID}, n.LegacyIDs...)
+}
+
+// trackingParams are query keys that vary per request or per referrer and say
+// nothing about which article this is.
+var trackingParams = map[string]bool{
+	"utm_source": true, "utm_medium": true, "utm_campaign": true,
+	"utm_term": true, "utm_content": true, "utm_id": true,
+	"ref": true, "source": true, "fbclid": true, "gclid": true,
+	"mc_cid": true, "mc_eid": true, "_ga": true,
+}
+
+// normalizeKey turns a URL into a canonical, comparable form: lowercase scheme
+// and host, no fragment, no tracking parameters, no trailing slash. Anything
+// that is not a URL is just trimmed and lowercased.
+func normalizeKey(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return strings.ToLower(raw)
+	}
+
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	u.Fragment = ""
+	u.RawFragment = ""
+
+	if q := u.Query(); len(q) > 0 {
+		for k := range q {
+			if trackingParams[strings.ToLower(k)] {
+				q.Del(k)
+			}
+		}
+		u.RawQuery = q.Encode() // Encode sorts keys, so order cannot matter
+	}
+	if u.Path != "/" {
+		u.Path = strings.TrimSuffix(u.Path, "/")
+	}
+	return u.String()
+}
+
+// itemKeys derives the dedup key for an entry, plus the keys older builds may
+// already have recorded for it.
+//
+// The article link is preferred over the guid: a guid is only required to be
+// unique, not stable, and feed bridges regenerate it on every request (adding a
+// timestamp or a hash of the fetch). A rotating guid makes every poll look like
+// fresh news, which re-posts the same articles forever. The canonical URL of an
+// article does not change.
+func itemKeys(guid, link, title string) (id string, legacy []string) {
+	switch {
+	case link != "":
+		id = normalizeKey(link)
+	case guid != "":
+		id = normalizeKey(guid)
+	default:
+		// No URL at all: fall back to the title so the entry still dedups.
+		if t := strings.ToLower(strings.Join(strings.Fields(title), " ")); t != "" {
+			id = "title:" + t
+		}
+	}
+	if id == "" {
+		return "", nil
+	}
+
+	// Keys a previous build would have written for this same entry.
+	for _, raw := range []string{strings.TrimSpace(guid), strings.TrimSpace(link)} {
+		if raw != "" && raw != id {
+			legacy = append(legacy, raw)
+		}
+	}
+	return id, legacy
 }
 
 // fetchNews retrieves and parses the configured RSS or Atom feed.
@@ -98,15 +180,14 @@ type atomLink struct {
 
 func (f atomFeed) toItems() []NewsItem {
 	items := make([]NewsItem, 0, len(f.Entries))
+	seen := make(map[string]bool, len(f.Entries))
 	for _, e := range f.Entries {
 		link := e.primaryLink()
-		id := strings.TrimSpace(e.ID)
-		if id == "" {
-			id = link
+		id, legacy := itemKeys(e.ID, link, e.Title)
+		if id == "" || seen[id] {
+			continue // unusable, or the same article twice in one feed
 		}
-		if id == "" {
-			continue
-		}
+		seen[id] = true
 
 		summary := e.Summary.plain()
 		if summary == "" {
@@ -121,6 +202,7 @@ func (f atomFeed) toItems() []NewsItem {
 		rawHTML := e.Summary.HTML + e.Content.HTML + e.Summary.Body + e.Content.Body
 		items = append(items, NewsItem{
 			ID:        id,
+			LegacyIDs: legacy,
 			Title:     strings.TrimSpace(e.Title),
 			Link:      link,
 			Published: pub,
@@ -184,15 +266,14 @@ type rssGUID struct {
 
 func (f rssFeed) toItems() []NewsItem {
 	items := make([]NewsItem, 0, len(f.Channel.Items))
+	seen := make(map[string]bool, len(f.Channel.Items))
 	for _, it := range f.Channel.Items {
 		link := strings.TrimSpace(it.Link)
-		id := strings.TrimSpace(it.GUID.Value)
-		if id == "" {
-			id = link
+		id, legacy := itemKeys(it.GUID.Value, link, it.Title)
+		if id == "" || seen[id] {
+			continue // unusable, or the same article twice in one feed
 		}
-		if id == "" {
-			continue
-		}
+		seen[id] = true
 
 		summary := it.Description
 		if summary == "" {
@@ -202,6 +283,7 @@ func (f rssFeed) toItems() []NewsItem {
 
 		items = append(items, NewsItem{
 			ID:        id,
+			LegacyIDs: legacy,
 			Title:     strings.TrimSpace(it.Title),
 			Link:      link,
 			Published: parseTime(it.PubDate),
@@ -284,7 +366,6 @@ func cropExcerpt(s string, max int) string {
 	}
 	return strings.TrimSpace(string(cut)) + "…"
 }
-
 
 // imgSrcRE finds img src attributes in HTML fragments from the feed.
 var imgSrcRE = regexp.MustCompile(`(?i)<img[^>]+src=["']([^"']+)["']`)

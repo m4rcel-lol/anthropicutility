@@ -451,7 +451,7 @@ func (b *Bot) cmdInfo(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if it.ID == "" {
 			continue
 		}
-		seen, err := b.store.Has(it.ID, i.GuildID)
+		seen, err := b.store.HasAny(i.GuildID, it.keys()...)
 		if err != nil {
 			log.Printf("event=store_error op=has id=%q guild=%s err=%q", it.ID, i.GuildID, err.Error())
 			checkFailed++
@@ -869,7 +869,7 @@ func (b *Bot) handleItem(item NewsItem, guilds []GuildConfig) {
 	}
 
 	for _, g := range guilds {
-		seen, err := b.store.Has(item.ID, g.GuildID)
+		seen, err := b.store.HasAny(g.GuildID, item.keys()...)
 		if err != nil {
 			log.Printf("event=store_error op=has id=%q guild=%s err=%q", item.ID, g.GuildID, err.Error())
 			continue

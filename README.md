@@ -55,6 +55,19 @@ restating the ping role:
 `remove_ping_role:true` in the same call is rejected. Editing a setup does not
 re-post already-delivered items — use `/postall` for that.
 
+### Duplicate protection
+
+The dedup key is the article's canonical URL — lowercased host, no fragment, no
+`utm_*`/tracking parameters, no trailing slash — not the feed's `<guid>`. A guid
+only has to be unique, not stable, and feed bridges commonly regenerate it on
+every request; that made each poll look like fresh news and re-posted the same
+articles forever. An entry appearing twice in one fetch is collapsed, and the
+raw guid/link are still checked against history so changing the key scheme does
+not replay the backlog.
+
+Ping role IDs are normalized to the bare snowflake on both read and write, so a
+value stored as a full mention cannot be re-wrapped into a doubled `@`.
+
 ### Per-server delivery history
 
 Delivery is tracked per `(item, server)`, so each server has its own "already
