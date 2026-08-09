@@ -7,8 +7,9 @@ Minimal Go Discord bot that polls a global Anthropic news RSS/Atom feed and post
 - Polls a single global feed (`NEWS_SOURCE_URL`) on a fixed interval
 - Per-server `/setup` (channel + optional ping role)
 - `/info` — feed status, newest item, posts anything not yet delivered to this server
+- `/postall` — force-post the whole feed to this server's channel, ignoring history
 - `/credits` — author and stack
-- SQLite history so items are not re-posted after restarts
+- SQLite history, tracked **per server**, so items are not re-posted after restarts
 - Embeds: white accent, AI logo thumbnail/footer, post banner image when available
 - Presence: Idle · Watching `Anthropic News | N servers`
 
@@ -17,8 +18,22 @@ Minimal Go Discord bot that polls a global Anthropic news RSS/Atom feed and post
 | Command | Who | What |
 |---------|-----|------|
 | `/setup channel:#… [ping_role:@…]` | Manage Server / Admin | Configure this server (once) |
-| `/info` | Anyone | Feed info + check/post new items |
+| `/info` | Anyone | Feed info + check/post new items for this server |
+| `/postall [ping:true\|false]` | Manage Server / Admin | Post **every** feed entry to this server's channel, even ones already posted |
 | `/credits` | Anyone | Credits and tech stack |
+
+### Per-server delivery history
+
+Delivery is tracked per `(item, server)`, so each server has its own "already
+posted" state — a server added later still receives everything it has not seen.
+`/info` reports failures explicitly instead of claiming the channel is up to
+date, so missing channel permissions are visible rather than silent.
+
+`/postall` ignores that history entirely: it posts every entry currently in the
+feed to the channel from `/setup`, mentioning the configured ping role (pass
+`ping:false` to post the same backlog without the mention). Sends are spaced out
+to stay within Discord's per-channel rate limit. Use it to seed a server that was
+set up after the news had already been published elsewhere.
 
 ## Discord invite
 
@@ -51,6 +66,12 @@ docker compose up -d --build
 ```
 
 Named volume `bot-data` persists `/data/bot.db`.
+
+On startup the store upgrades a database written by an older build, where
+`posted_items` was keyed by item id alone and dedup was global across all
+servers. Existing rows are attributed to every server configured at that moment,
+so no server is spammed with its backlog; use `/postall` to seed a server on
+purpose.
 
 ## Layout
 

@@ -23,6 +23,10 @@ var brandIcon []byte
 
 const brandIconName = "icon.jpg"
 
+// Pause between /postall sends so a full backlog does not hit the per-channel
+// message rate limit in one burst.
+const postAllDelay = 750 * time.Millisecond
+
 // Bot owns the Discord session and orchestrates poll → post + slash commands.
 type Bot struct {
 	cfg   *Config
@@ -92,6 +96,18 @@ func (b *Bot) onReady(s *discordgo.Session, r *discordgo.Ready) {
 			Name:        "info",
 			Description: "Show RSS feed info, check for newest news, and post anything new",
 		},
+		{
+			Name:        "postall",
+			Description: "Force-post every news item to this server's channel, even ones already posted",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionBoolean,
+					Name:        "ping",
+					Description: "Mention the configured ping role on each post (default: true)",
+					Required:    false,
+				},
+			},
+		},
 	}
 
 	for _, cmd := range commands {
@@ -116,6 +132,8 @@ func (b *Bot) onInteractionCreate(s *discordgo.Session, i *discordgo.Interaction
 		b.cmdCredits(s, i)
 	case "info":
 		b.cmdInfo(s, i)
+	case "postall":
+		b.cmdPostAll(s, i)
 	}
 }
 
@@ -228,8 +246,12 @@ func (b *Bot) cmdInfo(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		lines = append(lines, "• Ping role: _(none)_")
 	}
 
-	// Check for items not yet posted to this guild; post them (oldest first).
+	// Check for items not yet posted to *this* guild; post them (oldest first).
+	// Delivery history is tracked per server, so a server that was set up later
+	// still receives everything it has not seen yet.
 	var newItems []NewsItem
+	checkFailed := 0
+	var firstCheckErr string
 	for _, it := range items {
 		if it.ID == "" {
 			continue
@@ -237,6 +259,10 @@ func (b *Bot) cmdInfo(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		seen, err := b.store.Has(it.ID, i.GuildID)
 		if err != nil {
 			log.Printf("event=store_error op=has id=%q guild=%s err=%q", it.ID, i.GuildID, err.Error())
+			checkFailed++
+			if firstCheckErr == "" {
+				firstCheckErr = err.Error()
+			}
 			continue
 		}
 		if !seen {
@@ -249,23 +275,158 @@ func (b *Bot) cmdInfo(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return newItems[a].Published.Before(newItems[b].Published)
 	})
 
-	posted := 0
+	posted, postFailed := 0, 0
+	var firstPostErr string
 	for _, it := range newItems {
 		if err := b.postItemToGuild(it, *cfg); err != nil {
 			log.Printf("event=info_post_error id=%q guild=%s err=%q", it.ID, i.GuildID, err.Error())
+			postFailed++
+			if firstPostErr == "" {
+				firstPostErr = err.Error()
+			}
 			continue
 		}
 		posted++
 	}
 
+	// Never report "up to date" when a check or a post actually failed — that is
+	// what made a newly configured server look like it had nothing to receive.
 	lines = append(lines, "")
-	if posted > 0 {
-		lines = append(lines, fmt.Sprintf("**Check result:** found **%d** new item(s) and posted them to <#%s>.", posted, cfg.ChannelID))
-	} else {
-		lines = append(lines, "**Check result:** no new items — channel is already up to date.")
+	switch {
+	case posted > 0:
+		lines = append(lines, fmt.Sprintf("**Check result:** found **%d** new item(s) for this server and posted them to <#%s>.", posted, cfg.ChannelID))
+	case checkFailed == 0 && postFailed == 0:
+		lines = append(lines, fmt.Sprintf("**Check result:** no new items for this server — <#%s> is up to date.", cfg.ChannelID))
+	default:
+		lines = append(lines, "**Check result:** nothing could be posted.")
+	}
+	if postFailed > 0 {
+		lines = append(lines,
+			fmt.Sprintf("⚠️ **%d item(s) failed to post** to <#%s> — `%s`", postFailed, cfg.ChannelID, firstPostErr),
+			"Check the bot's channel permissions: **View Channel**, **Send Messages**, **Embed Links**, **Attach Files**.",
+		)
+	}
+	if checkFailed > 0 {
+		lines = append(lines, fmt.Sprintf("⚠️ **%d item(s) could not be checked** against this server's history — `%s`", checkFailed, firstCheckErr))
+	}
+	lines = append(lines, "", "_Delivery history is tracked separately for every server._")
+
+	log.Printf("event=info guild=%s items=%d new=%d posted=%d post_failed=%d check_failed=%d",
+		i.GuildID, len(items), len(newItems), posted, postFailed, checkFailed)
+	b.followupEphemeral(s, i, strings.Join(lines, "\n"))
+}
+
+// cmdPostAll posts every entry currently in the feed to this server's configured
+// channel, ignoring the per-server delivery history. Useful to seed a server that
+// was set up after items had already been published elsewhere.
+func (b *Bot) cmdPostAll(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if i.GuildID == "" || i.Member == nil {
+		b.respondEphemeral(s, i, "This command can only be used inside a server.")
+		return
+	}
+	// Same gate as /setup: this can write dozens of messages and ping a role.
+	perms := i.Member.Permissions
+	if perms&discordgo.PermissionAdministrator == 0 && perms&discordgo.PermissionManageServer == 0 {
+		b.respondEphemeral(s, i, "You need **Manage Server** or **Administrator** to run `/postall`.")
+		return
 	}
 
-	log.Printf("event=info guild=%s items=%d new=%d posted=%d", i.GuildID, len(items), len(newItems), posted)
+	// Defer — fetching plus posting every item takes well past the 3s ACK window.
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Flags: discordgo.MessageFlagsEphemeral,
+		},
+	})
+	if err != nil {
+		log.Printf("event=interaction_respond_error op=defer cmd=postall err=%q", err.Error())
+		return
+	}
+
+	cfg, err := b.store.GetGuildConfig(i.GuildID)
+	if err != nil {
+		log.Printf("event=postall_error op=get_config guild=%s err=%q", i.GuildID, err.Error())
+		b.followupEphemeral(s, i, "Failed to read server settings.")
+		return
+	}
+	if cfg == nil {
+		b.followupEphemeral(s, i, "This server is not configured yet — run `/setup` first.")
+		return
+	}
+
+	ping := true
+	for _, o := range i.ApplicationCommandData().Options {
+		if o.Name == "ping" {
+			ping = o.BoolValue()
+		}
+	}
+
+	log.Printf("event=postall_fetch guild=%s url=%s ping=%t", i.GuildID, b.cfg.NewsSourceURL, ping)
+	items, err := fetchNews(b.cfg.NewsSourceURL)
+	if err != nil {
+		log.Printf("event=postall_fetch_error guild=%s err=%q", i.GuildID, err.Error())
+		b.followupEphemeral(s, i, fmt.Sprintf("Failed to fetch the feed — `%s`\nNothing was posted.", err.Error()))
+		return
+	}
+	if len(items) == 0 {
+		b.followupEphemeral(s, i, "The feed returned no entries — nothing to post.")
+		return
+	}
+
+	// Oldest first so the channel timeline reads chronologically.
+	sort.Slice(items, func(a, b int) bool {
+		return items[a].Published.Before(items[b].Published)
+	})
+
+	// Post to the configured channel with the configured role, per this server's
+	// /setup. `ping:false` suppresses the mention without changing the setup.
+	target := *cfg
+	if !ping {
+		target.PingRoleID = ""
+	}
+
+	posted, failed := 0, 0
+	var firstErr string
+	for idx, it := range items {
+		if err := b.postItemToGuild(it, target); err != nil {
+			log.Printf("event=postall_post_error guild=%s id=%q err=%q", i.GuildID, it.ID, err.Error())
+			failed++
+			if firstErr == "" {
+				firstErr = err.Error()
+			}
+			continue
+		}
+		posted++
+		// Space out sends so a full backlog does not slam the channel rate limit.
+		if idx < len(items)-1 {
+			time.Sleep(postAllDelay)
+		}
+	}
+
+	var lines []string
+	lines = append(lines,
+		"**/postall**",
+		fmt.Sprintf("• Entries in feed: **%d**", len(items)),
+		fmt.Sprintf("• Posted to <#%s>: **%d**", cfg.ChannelID, posted),
+	)
+	if cfg.PingRoleID != "" {
+		if ping {
+			lines = append(lines, fmt.Sprintf("• Ping role: <@&%s>", cfg.PingRoleID))
+		} else {
+			lines = append(lines, fmt.Sprintf("• Ping role: <@&%s> _(suppressed for this run)_", cfg.PingRoleID))
+		}
+	} else {
+		lines = append(lines, "• Ping role: _(none)_")
+	}
+	if failed > 0 {
+		lines = append(lines,
+			fmt.Sprintf("• Failed: **%d** — `%s`", failed, firstErr),
+			"Check the bot's channel permissions: **View Channel**, **Send Messages**, **Embed Links**, **Attach Files**.",
+		)
+	}
+
+	log.Printf("event=postall guild=%s channel=%s items=%d posted=%d failed=%d ping=%t",
+		i.GuildID, cfg.ChannelID, len(items), posted, failed, ping)
 	b.followupEphemeral(s, i, strings.Join(lines, "\n"))
 }
 
