@@ -6,10 +6,25 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// roleIDDigits keeps only the snowflake digits of a role reference.
+var roleIDDigits = regexp.MustCompile(`\d+`)
+
+// normalizeRoleID reduces a role reference to its bare snowflake. A value that
+// arrived as a full mention ("<@&123>") or with a stray prefix ("@123", "&123")
+// would otherwise be re-wrapped into "<@&<@&123>>" when rendered, which Discord
+// shows with a doubled @. Normalizing on read as well as on write repairs rows
+// written by older builds without needing a data migration.
+func normalizeRoleID(s string) string {
+	m := roleIDDigits.FindString(strings.TrimSpace(s))
+	return m
+}
 
 // GuildConfig is the per-server setup written by /setup.
 type GuildConfig struct {
@@ -176,6 +191,26 @@ func (s *Store) Has(id, guildID string) (bool, error) {
 	return true, nil
 }
 
+// HasAny reports whether any of these keys was already posted to this guild.
+// An item carries its current key plus the keys older builds may have written
+// for the same article, so changing how keys are derived does not make the
+// whole backlog look new.
+func (s *Store) HasAny(guildID string, ids ...string) (bool, error) {
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		found, err := s.Has(id, guildID)
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Mark records that the item was successfully posted to this guild.
 func (s *Store) Mark(id, guildID string) error {
 	_, err := s.db.Exec(
@@ -218,7 +253,7 @@ func (s *Store) SetGuildConfig(guildID, channelID, pingRoleID string) error {
 		ON CONFLICT(guild_id) DO UPDATE SET
 			channel_id   = excluded.channel_id,
 			ping_role_id = excluded.ping_role_id
-	`, guildID, channelID, pingRoleID)
+	`, guildID, channelID, normalizeRoleID(pingRoleID))
 	return err
 }
 
@@ -235,6 +270,7 @@ func (s *Store) GetGuildConfig(guildID string) (*GuildConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.PingRoleID = normalizeRoleID(c.PingRoleID)
 	return &c, nil
 }
 
@@ -252,6 +288,7 @@ func (s *Store) AllGuildConfigs() ([]GuildConfig, error) {
 		if err := rows.Scan(&c.GuildID, &c.ChannelID, &c.PingRoleID); err != nil {
 			return nil, err
 		}
+		c.PingRoleID = normalizeRoleID(c.PingRoleID)
 		out = append(out, c)
 	}
 	return out, rows.Err()
