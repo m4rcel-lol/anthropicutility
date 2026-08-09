@@ -48,6 +48,11 @@ func openStore(path string) (*Store, error) {
 			channel_id   TEXT NOT NULL,
 			ping_role_id TEXT NOT NULL DEFAULT ''
 		);
+		CREATE TABLE IF NOT EXISTS greeted_guilds (
+			guild_id   TEXT PRIMARY KEY,
+			user_id    TEXT NOT NULL,
+			greeted_at TEXT NOT NULL
+		);
 	`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -178,6 +183,29 @@ func (s *Store) Mark(id, guildID string) error {
 		id,
 		guildID,
 		time.Now().UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
+// HasGreeted reports whether the welcome DM was already sent for this guild.
+// Keeps a re-invite or a reconnect from DMing the same person twice.
+func (s *Store) HasGreeted(guildID string) (bool, error) {
+	var exists int
+	err := s.db.QueryRow(`SELECT 1 FROM greeted_guilds WHERE guild_id = ?`, guildID).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// MarkGreeted records that the welcome DM for this guild reached userID.
+func (s *Store) MarkGreeted(guildID, userID string) error {
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO greeted_guilds (guild_id, user_id, greeted_at) VALUES (?, ?, ?)`,
+		guildID, userID, time.Now().UTC().Format(time.RFC3339),
 	)
 	return err
 }

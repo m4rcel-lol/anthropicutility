@@ -95,3 +95,46 @@ func TestOpenStoreIdempotent(t *testing.T) {
 		t.Error("history lost on reopen")
 	}
 }
+
+// The welcome DM must be sent at most once per server, and tracked per server.
+func TestGreetedGuildsIsPerGuildAndOnce(t *testing.T) {
+	store, err := openStore(filepath.Join(t.TempDir(), "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	greeted, err := store.HasGreeted("guild-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if greeted {
+		t.Fatal("HasGreeted on a fresh store = true, want false")
+	}
+
+	if err := store.MarkGreeted("guild-1", "user-1"); err != nil {
+		t.Fatal(err)
+	}
+	if greeted, _ := store.HasGreeted("guild-1"); !greeted {
+		t.Error("HasGreeted after MarkGreeted = false, want true")
+	}
+
+	// A different server is untouched.
+	if greeted, _ := store.HasGreeted("guild-2"); greeted {
+		t.Error("greeting leaked to another guild")
+	}
+
+	// Re-marking (re-invite, reconnect) must not error or duplicate.
+	if err := store.MarkGreeted("guild-1", "user-2"); err != nil {
+		t.Fatalf("second MarkGreeted: %v", err)
+	}
+
+	// Upgrading an older database that predates the table must still work.
+	var rows int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM greeted_guilds WHERE guild_id = 'guild-1'`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Errorf("greeted_guilds rows for guild-1 = %d, want 1", rows)
+	}
+}

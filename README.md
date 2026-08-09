@@ -12,6 +12,7 @@ Minimal Go Discord bot that polls a global Anthropic news RSS/Atom feed and post
 - SQLite history, tracked **per server**, so items are not re-posted after restarts
 - Embeds: white accent, AI logo thumbnail/footer, post banner image when available
 - Presence: Idle · Watching `Anthropic News | N servers`
+- Welcome DM to whoever invites the bot, with setup instructions
 
 ## Commands
 
@@ -20,7 +21,23 @@ Minimal Go Discord bot that polls a global Anthropic news RSS/Atom feed and post
 | `/setup [channel:#…] [ping_role:@…] [remove_ping_role:true]` | Manage Server / Admin | Configure this server, or edit an existing setup |
 | `/info` | Anyone | Feed info + check/post new items for this server |
 | `/postall [ping:true\|false]` | Manage Server / Admin | Post **every** feed entry to this server's channel, even ones already posted |
-| `/credits` | Anyone | Credits and tech stack |
+| `/credits` | Anyone | Credits, tech stack and the official server link |
+
+### Welcome DM
+
+When the bot joins a server it DMs the person who invited it: three embeds
+covering what the bot does, the `/setup` → `/info` → `/postall` steps, and the
+permissions it needs, plus a button to the official server.
+
+The inviter is read from the audit log (`BOT_ADD`); when the bot lacks **View
+Audit Log** — common on a fresh invite — it falls back to the server owner. A
+DM is sent at most once per server (tracked in `greeted_guilds`), and the
+gateway replaying guilds on reconnect never triggers one: only joins newer than
+five minutes qualify. A failed DM (inviter has DMs closed) is logged and
+skipped, never retried in a loop.
+
+The official server link is a compile-time constant in `bot.go`, not an
+environment variable — it is the same for every deployment.
 
 ### Editing a setup
 

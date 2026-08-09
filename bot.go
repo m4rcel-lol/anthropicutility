@@ -27,6 +27,16 @@ const brandIconName = "icon.jpg"
 // message rate limit in one burst.
 const postAllDelay = 750 * time.Millisecond
 
+// Official community/support server. A compile-time constant on purpose: it is
+// the same for every deployment, so it is deliberately NOT an env var — no
+// operator should have to set it, and none should be able to point users
+// somewhere else.
+const supportServerInvite = "https://discord.gg/anthropicutility"
+
+// A GuildCreate older than this is the gateway re-sending guilds we were
+// already in (startup, reconnect), not a fresh invite — do not DM for those.
+const joinGreetWindow = 5 * time.Minute
+
 // Bot owns the Discord session and orchestrates poll → post + slash commands.
 type Bot struct {
 	cfg   *Config
@@ -47,6 +57,7 @@ func newBot(cfg *Config, store *Store) (*Bot, error) {
 
 	sess.AddHandler(b.onReady)
 	sess.AddHandler(b.onInteractionCreate)
+	sess.AddHandler(b.onGuildCreate)
 
 	if err := sess.Open(); err != nil {
 		return nil, fmt.Errorf("discord open: %w", err)
@@ -128,6 +139,179 @@ func (b *Bot) onReady(s *discordgo.Session, r *discordgo.Ready) {
 	}
 }
 
+// onGuildCreate greets whoever invited the bot with a DM explaining what to do
+// next. The gateway also replays GuildCreate for guilds we are already in, so
+// this only fires for genuinely fresh joins that were never greeted before.
+func (b *Bot) onGuildCreate(s *discordgo.Session, g *discordgo.GuildCreate) {
+	if g.Unavailable {
+		return
+	}
+
+	// Keep the server count in the presence honest as servers come and go.
+	defer b.setPresence(s)
+
+	if time.Since(g.JoinedAt) > joinGreetWindow {
+		return // replayed on connect, not a new invite
+	}
+	greeted, err := b.store.HasGreeted(g.ID)
+	if err != nil {
+		log.Printf("event=store_error op=has_greeted guild=%s err=%q", g.ID, err.Error())
+		return
+	}
+	if greeted {
+		log.Printf("event=welcome_skip reason=already_greeted guild=%s", g.ID)
+		return
+	}
+
+	inviterID := b.resolveInviterID(s, g)
+	if inviterID == "" {
+		log.Printf("event=welcome_skip reason=no_recipient guild=%s", g.ID)
+		return
+	}
+
+	if err := b.sendWelcomeDM(s, inviterID, g.Guild); err != nil {
+		// Overwhelmingly this is the user having DMs from server members closed.
+		log.Printf("event=welcome_error guild=%s user=%s err=%q", g.ID, inviterID, err.Error())
+		return
+	}
+	if err := b.store.MarkGreeted(g.ID, inviterID); err != nil {
+		log.Printf("event=store_error op=mark_greeted guild=%s err=%q", g.ID, err.Error())
+	}
+	log.Printf("event=welcome_sent guild=%s guild_name=%q user=%s", g.ID, g.Name, inviterID)
+}
+
+// resolveInviterID finds who added the bot, via the audit log. That needs the
+// View Audit Log permission, which a fresh invite often lacks, so it falls back
+// to the server owner — who can act on the instructions either way.
+func (b *Bot) resolveInviterID(s *discordgo.Session, g *discordgo.GuildCreate) string {
+	var selfID string
+	if s.State != nil && s.State.User != nil {
+		selfID = s.State.User.ID
+	}
+
+	if selfID != "" {
+		auditLog, err := s.GuildAuditLog(g.ID, "", "", int(discordgo.AuditLogActionBotAdd), 10)
+		if err != nil {
+			log.Printf("event=audit_log_unavailable guild=%s err=%q", g.ID, err.Error())
+		} else {
+			for _, e := range auditLog.AuditLogEntries {
+				if e.TargetID == selfID && e.UserID != "" {
+					return e.UserID
+				}
+			}
+		}
+	}
+
+	if g.OwnerID != "" {
+		log.Printf("event=welcome_fallback target=owner guild=%s", g.ID)
+	}
+	return g.OwnerID
+}
+
+// sendWelcomeDM opens a DM and sends the three-embed welcome: thanks, the
+// setup steps, and where to get help.
+func (b *Bot) sendWelcomeDM(s *discordgo.Session, userID string, g *discordgo.Guild) error {
+	ch, err := s.UserChannelCreate(userID)
+	if err != nil {
+		return fmt.Errorf("open dm: %w", err)
+	}
+
+	iconRef := "attachment://" + brandIconName
+	serverName := g.Name
+	if serverName == "" {
+		serverName = "your server"
+	}
+
+	// Embed 1 — thanks + what this bot is for.
+	// Only this embed references the attachment: Discord binds an uploaded file
+	// to a single embed, so reusing the URL further down would render blank.
+	thanks := &discordgo.MessageEmbed{
+		Title: "Thanks for the invite!",
+		Description: fmt.Sprintf(
+			"**Anthropic Utility** is now in **%s**.\n\n"+
+				"It watches Anthropic's news feed and posts every new article to a channel you pick — "+
+				"title, excerpt, banner image and link, with an optional role mention.\n\n"+
+				"One thing left to do: tell it where to post.",
+			serverName,
+		),
+		Color:     embedColor,
+		Thumbnail: &discordgo.MessageEmbedThumbnail{URL: iconRef},
+	}
+
+	// Embed 2 — the actual instructions.
+	steps := &discordgo.MessageEmbed{
+		Title: "Set it up in under a minute",
+		Color: embedColor,
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name: "1. Pick the channel",
+				Value: "```/setup channel:#news ping_role:@Updates```" +
+					"`ping_role` is optional. Re-run `/setup` any time to change either one — " +
+					"it edits the existing setup and shows you exactly what changed.",
+			},
+			{
+				Name: "2. Confirm it works",
+				Value: "```/info```" +
+					"Shows the feed status and the newest article, and immediately posts anything " +
+					"this server has not received yet. If a post fails, it tells you why.",
+			},
+			{
+				Name: "3. Fill the channel (optional)",
+				Value: "```/postall```" +
+					"Posts the entire current feed, including articles already delivered elsewhere. " +
+					"Handy for a brand-new channel. Add `ping:false` to skip the role mention.",
+			},
+		},
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "/setup and /postall need Manage Server or Administrator.",
+		},
+	}
+
+	// Embed 3 — permissions, guarantees, support.
+	help := &discordgo.MessageEmbed{
+		Title: "Good to know",
+		Color: embedColor,
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name: "Permissions it needs in the news channel",
+				Value: "View Channel · Send Messages · Embed Links · Attach Files\n" +
+					"Missing one is the usual reason posts do not show up — `/info` will name it.",
+			},
+			{
+				Name: "Every server is independent",
+				Value: "Channel, role and delivery history are stored per server, " +
+					"so this one gets its own posts no matter what other servers already received.",
+			},
+			{
+				Name:  "Questions, bugs or ideas",
+				Value: fmt.Sprintf("Join the official server: %s\nRun `/credits` for the source and the stack.", supportServerInvite),
+			},
+		},
+	}
+
+	_, err = s.ChannelMessageSendComplex(ch.ID, &discordgo.MessageSend{
+		Embeds: []*discordgo.MessageEmbed{thanks, steps, help},
+		Files: []*discordgo.File{
+			{Name: brandIconName, Reader: bytes.NewReader(brandIcon)},
+		},
+		Components: []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.Button{
+						Label: "Join the official server",
+						Style: discordgo.LinkButton,
+						URL:   supportServerInvite,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("send dm: %w", err)
+	}
+	return nil
+}
+
 func (b *Bot) onInteractionCreate(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	if i.Type != discordgo.InteractionApplicationCommand {
 		return
@@ -156,6 +340,9 @@ func (b *Bot) cmdCredits(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		"• Discord: `github.com/bwmarrin/discordgo`",
 		"• Storage: SQLite via `modernc.org/sqlite` (pure Go)",
 		"• Feed: standard library `net/http` + `encoding/xml` (RSS 2.0 / Atom 1.0)",
+		"",
+		"**Official server**",
+		supportServerInvite,
 	}, "\n")
 
 	log.Printf("event=credits user=%s guild=%s", interactionUserID(i), i.GuildID)
