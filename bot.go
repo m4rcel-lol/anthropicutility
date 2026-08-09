@@ -68,13 +68,15 @@ func (b *Bot) onReady(s *discordgo.Session, r *discordgo.Ready) {
 	commands := []*discordgo.ApplicationCommand{
 		{
 			Name:        "setup",
-			Description: "Configure the news channel and optional ping role for this server",
+			Description: "Configure or edit the news channel and ping role for this server",
 			Options: []*discordgo.ApplicationCommandOption{
 				{
 					Type:        discordgo.ApplicationCommandOptionChannel,
 					Name:        "channel",
 					Description: "Channel where Anthropic news embeds will be posted",
-					Required:    true,
+					// Optional so an existing setup can be edited one field at a
+					// time; required on first run, enforced in cmdSetup.
+					Required: false,
 					ChannelTypes: []discordgo.ChannelType{
 						discordgo.ChannelTypeGuildText,
 						discordgo.ChannelTypeGuildNews,
@@ -84,6 +86,12 @@ func (b *Bot) onReady(s *discordgo.Session, r *discordgo.Ready) {
 					Type:        discordgo.ApplicationCommandOptionRole,
 					Name:        "ping_role",
 					Description: "Role to mention when a new post arrives (optional)",
+					Required:    false,
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionBoolean,
+					Name:        "remove_ping_role",
+					Description: "Stop mentioning any role on new posts",
 					Required:    false,
 				},
 			},
@@ -442,32 +450,22 @@ func (b *Bot) cmdSetup(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	// Detect existing setup — do not overwrite; tell the user nothing more is needed.
+	// An existing setup is editable: re-running /setup applies whatever was
+	// passed and reports what changed, so a wrong channel or role can be fixed
+	// in place instead of being refused.
 	existing, err := b.store.GetGuildConfig(i.GuildID)
 	if err != nil {
 		log.Printf("event=setup_error op=get guild=%s err=%q", i.GuildID, err.Error())
 		b.respondEphemeral(s, i, "Failed to read settings. Try again later.")
 		return
 	}
-	if existing != nil {
-		msg := fmt.Sprintf(
-			"This server is **already set up** — nothing more needs to be configured.\n\n• News channel: <#%s>",
-			existing.ChannelID,
-		)
-		if existing.PingRoleID != "" {
-			msg += fmt.Sprintf("\n• Ping role: <@&%s>", existing.PingRoleID)
-		} else {
-			msg += "\n• Ping role: _(none)_"
-		}
-		msg += "\n\nThe news feed is global and the same for every server — it cannot be changed here."
-		log.Printf("event=setup_already guild=%s channel=%s ping_role=%s", i.GuildID, existing.ChannelID, existing.PingRoleID)
-		b.respondEphemeral(s, i, msg)
-		return
-	}
 
-	opts := i.ApplicationCommandData().Options
-	var channelID, pingRoleID string
-	for _, o := range opts {
+	var (
+		channelID, pingRoleID string
+		pingProvided          bool
+		removePing            bool
+	)
+	for _, o := range i.ApplicationCommandData().Options {
 		switch o.Name {
 		case "channel":
 			if ch := o.ChannelValue(s); ch != nil {
@@ -476,30 +474,110 @@ func (b *Bot) cmdSetup(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		case "ping_role":
 			if role := o.RoleValue(s, i.GuildID); role != nil {
 				pingRoleID = role.ID
+				pingProvided = true
 			}
+		case "remove_ping_role":
+			removePing = o.BoolValue()
 		}
 	}
-	if channelID == "" {
-		b.respondEphemeral(s, i, "A text channel is required.")
+
+	newChannel, newPing, err := resolveSetup(existing, setupInput{
+		ChannelID:    channelID,
+		PingRoleID:   pingRoleID,
+		PingProvided: pingProvided,
+		RemovePing:   removePing,
+	})
+	if err != nil {
+		b.respondEphemeral(s, i, err.Error())
 		return
 	}
 
-	if err := b.store.SetGuildConfig(i.GuildID, channelID, pingRoleID); err != nil {
+	if existing != nil && existing.ChannelID == newChannel && existing.PingRoleID == newPing {
+		msg := fmt.Sprintf(
+			"**Nothing changed** — this server was already set up exactly like that.\n\n• News channel: <#%s>\n• Ping role: %s",
+			newChannel, roleLabel(newPing),
+		)
+		log.Printf("event=setup_unchanged guild=%s channel=%s ping_role=%s", i.GuildID, newChannel, newPing)
+		b.respondEphemeral(s, i, msg)
+		return
+	}
+
+	if err := b.store.SetGuildConfig(i.GuildID, newChannel, newPing); err != nil {
 		log.Printf("event=setup_error guild=%s err=%q", i.GuildID, err.Error())
 		b.respondEphemeral(s, i, "Failed to save settings. Try again later.")
 		return
 	}
 
-	msg := fmt.Sprintf("Setup saved.\n• News channel: <#%s>", channelID)
-	if pingRoleID != "" {
-		msg += fmt.Sprintf("\n• Ping role: <@&%s>", pingRoleID)
+	var msg string
+	if existing == nil {
+		msg = fmt.Sprintf("**Setup saved.**\n• News channel: <#%s>\n• Ping role: %s",
+			newChannel, roleLabel(newPing))
+		log.Printf("event=setup op=create guild=%s channel=%s ping_role=%s", i.GuildID, newChannel, newPing)
 	} else {
-		msg += "\n• Ping role: _(none)_"
+		// Show old → new for each field so the edit is unambiguous.
+		lines := []string{"**Setup edited.**", ""}
+		if existing.ChannelID != newChannel {
+			lines = append(lines, fmt.Sprintf("• News channel: <#%s> → **<#%s>**", existing.ChannelID, newChannel))
+		} else {
+			lines = append(lines, fmt.Sprintf("• News channel: <#%s> _(unchanged)_", newChannel))
+		}
+		if existing.PingRoleID != newPing {
+			lines = append(lines, fmt.Sprintf("• Ping role: %s → **%s**", roleLabel(existing.PingRoleID), roleLabel(newPing)))
+		} else {
+			lines = append(lines, fmt.Sprintf("• Ping role: %s _(unchanged)_", roleLabel(newPing)))
+		}
+		msg = strings.Join(lines, "\n")
+		log.Printf("event=setup op=edit guild=%s channel=%s→%s ping_role=%s→%s",
+			i.GuildID, existing.ChannelID, newChannel, existing.PingRoleID, newPing)
 	}
-	msg += "\n\nThe news feed is global and the same for every server — it cannot be changed here."
 
-	log.Printf("event=setup guild=%s channel=%s ping_role=%s", i.GuildID, channelID, pingRoleID)
+	msg += "\n\nThe news feed is global and the same for every server — it cannot be changed here."
+	msg += "\nAlready-delivered items are not re-posted; use `/postall` to seed a channel with the full feed."
 	b.respondEphemeral(s, i, msg)
+}
+
+// setupInput is what the user passed to /setup for this invocation.
+type setupInput struct {
+	ChannelID    string
+	PingRoleID   string
+	PingProvided bool // ping_role was supplied
+	RemovePing   bool // remove_ping_role:true was supplied
+}
+
+// resolveSetup merges a /setup invocation over the server's existing config.
+// Omitted fields keep their current value, so one field can be corrected without
+// restating the others. The channel is only mandatory on first run, when there
+// is nothing to fall back to.
+func resolveSetup(existing *GuildConfig, in setupInput) (channelID, pingRoleID string, err error) {
+	if in.PingProvided && in.RemovePing {
+		return "", "", fmt.Errorf("Pick one: either set `ping_role` or use `remove_ping_role:true` — not both.")
+	}
+
+	channelID = in.ChannelID
+	if channelID == "" {
+		if existing == nil {
+			return "", "", fmt.Errorf("A text channel is required the first time you run `/setup`.")
+		}
+		channelID = existing.ChannelID
+	}
+
+	switch {
+	case in.RemovePing:
+		pingRoleID = ""
+	case in.PingProvided:
+		pingRoleID = in.PingRoleID
+	case existing != nil:
+		pingRoleID = existing.PingRoleID
+	}
+	return channelID, pingRoleID, nil
+}
+
+// roleLabel renders a ping role for user-facing text, or "(none)" when unset.
+func roleLabel(roleID string) string {
+	if roleID == "" {
+		return "_(none)_"
+	}
+	return fmt.Sprintf("<@&%s>", roleID)
 }
 
 func (b *Bot) respondEphemeral(s *discordgo.Session, i *discordgo.InteractionCreate, content string) {
